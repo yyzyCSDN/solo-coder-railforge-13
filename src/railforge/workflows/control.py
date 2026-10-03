@@ -188,3 +188,7 @@ class RailForgeWorkflowControl:
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
 
+    def reserve_lease_batch(self, operation_id, batch, subject, at):
+        return self._commit(operation_id, "wagon.lease.batch_reserved", subject, at,
+                            lambda: batch.commit(operation_id))
+

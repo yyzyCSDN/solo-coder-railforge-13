@@ -15,12 +15,14 @@ from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
+from railforge.wagon.lease_batch import BatchReservation
+from railforge.wagon.lease_reposition import contract_key, optimize, unit_key
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
 
 
 class RailForgeFeatureService:
-    """Fifteen product workflows, all committed through the common control plane."""
+    """Sixteen product workflows, all committed through the common control plane."""
 
     def __init__(self, control):
         self.control = control
@@ -145,4 +147,20 @@ class RailForgeFeatureService:
             accepted = [consumer.accept(e) for e in events]
             return {"accepted": accepted, "delay": fused_delay(observations, max_lateness)}
         return self.control.run(operation_id, "feature.timeline.reconciled", operation_id, at, action)
+
+    def optimize_lease_reposition(self, operation_id, contracts, demands, routes, units, move_depart,
+                                  turn_minutes, expected_versions, at, risk_weight=1.0, loco_hourly_cost=0.0):
+        expected_versions = expected_versions or {}
+        def action():
+            plan = optimize(contracts, demands, routes, units, move_depart, turn_minutes,
+                            risk_weight, loco_hourly_cost)
+            batch = BatchReservation(self.control.store)
+            for contract_id, contract in plan.contract_updates.items():
+                batch.stage(contract_key(contract_id), contract,
+                            expected_versions.get(contract_key(contract_id)))
+            for unit_id, unit in plan.unit_updates.items():
+                batch.stage(unit_key(unit_id), unit, expected_versions.get(unit_key(unit_id)))
+            receipt = batch.commit(operation_id)
+            return {"plan": plan, "versions": dict(receipt.versions)}
+        return self.control.run(operation_id, "feature.wagon.lease_repositioned", operation_id, at, action)
 
