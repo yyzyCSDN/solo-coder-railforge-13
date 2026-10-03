@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from railforge.cargo.segregation import violations
 from railforge.commercial.contract_capacity import allocate as allocate_capacity
 from railforge.control.recovery import choose as choose_recovery
@@ -15,6 +17,7 @@ from railforge.planning.loco_circulation import circulate
 from railforge.planning.train_path_engine import build, section_load, train_delay
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import conflicts as block_conflicts
+from railforge.wagon.lease_reposition import optimize as optimize_lease_reposition
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
 
@@ -130,6 +133,39 @@ class RailForgeFeatureService:
             cycle = circulate(legs, units, turn_minutes)
             return {"wagons": selected, "cycle": cycle}
         return self.control.run(operation_id, "feature.wagons.repositioned", operation_id, at, action)
+
+    def lease_and_reposition_wagons(self, operation_id, wagons, contracts, routes, demands,
+                                    loco_units, turn_minutes, risk_penalty_rate, at,
+                                    expected_version=None):
+        def action():
+            store = self.control.lease_reservations
+            store.sync_catalog(wagons, routes, contracts)
+            snapshot = store.snapshot()
+            effective_wagons = []
+            effective_routes = []
+            effective_contracts = []
+            wagon_map = {w.wagon_id: w for w in wagons}
+            route_map = {r.route_id: r for r in routes}
+            for wagon_id, wagon in wagon_map.items():
+                reserved = max(wagon.reserved, snapshot.value.wagon_reserved.get(wagon_id, 0.0))
+                effective_wagons.append(replace(wagon, reserved=reserved))
+            for route_id, route in route_map.items():
+                reserved = max(route.reserved, snapshot.value.route_reserved.get(route_id, 0.0))
+                effective_routes.append(replace(route, reserved=reserved))
+            for contract in contracts:
+                reserved = max(contract.reserved, snapshot.value.contract_reserved.get(contract.contract_id, 0.0))
+                effective_contracts.append(replace(contract, reserved=reserved))
+            plan = optimize_lease_reposition(
+                effective_wagons, effective_contracts, effective_routes, demands,
+                loco_units, turn_minutes, risk_penalty_rate,
+            )
+            commitment = store.reserve(operation_id, plan, expected_version)
+            return {"plan": plan, "commitment": commitment,
+                    "version": commitment.version, "cost_trace": commitment.cost_trace}
+        return self.control.run(
+            operation_id, "feature.wagon.lease.repositioned", operation_id, at, action,
+            rollback=lambda: self.control.lease_reservations.rollback_commitment(operation_id),
+        )
 
     def calculate_compensation(self, operation_id, arrival, release, tariff, claim_case, claim_steps, at):
         from railforge.billing.demurrage import charge

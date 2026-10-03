@@ -35,6 +35,9 @@ class RailForgeService:
     def route_clearance(self, profile, segments):
         return route_ok(profile, segments)
 
+    def lease_and_reposition_wagons(self, *args, **kwargs):
+        return self.features.lease_and_reposition_wagons(*args, **kwargs)
+
     def workflow(self):
         return self.control
 

@@ -25,6 +25,7 @@ from railforge.signaling.block_occupancy import reserve
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
 from railforge.wagon.axle_load import route_ok as axle_route_ok
+from railforge.wagon.lease_reservation import LeaseReservationStore
 from railforge.yard.hump import classify
 from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
@@ -68,37 +69,45 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self.lease_reservations = LeaseReservationStore()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
         return dict(self._receipts)
 
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
-                action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
+                action: Callable[[], T], evidence: Mapping[str, Any] | None = None,
+                rollback: Callable[[], None] | None = None) -> OperationReceipt:
         previous = self._receipts.get(operation_id)
         if previous is not None:
             if previous.topic != topic or previous.subject != subject:
                 raise ValueError("operation id reused for a different workflow")
             return previous
         result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
+        try:
+            version = self.store.write(subject, _safe(result))
+            payload = {
+                "operation_id": operation_id,
+                "status": "committed",
+                "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
+                "version": version,
+                "result": _safe(result),
+                **dict(evidence or {}),
+            }
+            event = self.stream.publish(operation_id, at, topic, subject, payload)
+            audit = self.trail.append("railforge-control", topic, subject, at)
+        except Exception:
+            if rollback is not None:
+                rollback()
+            raise
         receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
         self._receipts[operation_id] = receipt
         return receipt
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
-            action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        return self._commit(operation_id, topic, subject, at, action, evidence)
+            action: Callable[[], T], evidence: Mapping[str, Any] | None = None,
+            rollback: Callable[[], None] | None = None) -> OperationReceipt:
+        return self._commit(operation_id, topic, subject, at, action, evidence, rollback)
 
     def reserve_block(self, operation_id, candidate, existing, clearance, at):
         return self._commit(operation_id, "dispatch.block.reserved", candidate.train, at,
